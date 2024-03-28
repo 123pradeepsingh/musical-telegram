@@ -1,0 +1,469 @@
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
+import openpyxl
+import re
+from PIL import Image
+import pytesseract
+from selenium import webdriver
+import time
+from datetime import datetime, timedelta
+from telegram import Chat
+import uuid
+import logging
+
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO  # Set the logging level according to your needs
+)
+
+# Get the logger for your bot
+logger = logging.getLogger(__name__)
+
+
+# Telegram bot token
+TOKEN = 'bot token'
+AUTHORIZED_USERS = [user id]
+
+# Excel file path
+EXCEL_FILE_PATH = '/content/gogle collab path file.xlsx'
+roi_coordinates_no_scroll = (x1,y1,x2,y2)
+roi_coordinates_scroll = (x1,y1,x2,y2)
+roi_coordinates_click = (x1,y1)
+# Conversation states
+NUM_URLS_STATE = 1
+URLS_STATE = 2
+ROW_NUMBER_STATE = 3
+SIR_COMMAND_STATE = 4
+
+def start(update: Update, context: CallbackContext) -> None:
+    print(f"Received command from user ID: {update.effective_user.id}")
+    """Send a message when the command /start is issued."""
+    user_id = update.effective_user.id  # Get the ID of the user who sent the command
+    context.bot.send_message(chat_id=user_id, text="Write /sir to provide URL")
+
+
+def sir_command(update: Update, context: CallbackContext) -> int:
+
+    chat_type = update.effective_chat.type
+
+    # Check if the chat type is private
+    if chat_type == Chat.PRIVATE:
+        update.message.reply_text("Please enter the serial number to proceed:")
+        return ROW_NUMBER_STATE
+        # Proceed with your conversation logic here
+        pass
+    else:
+        update.message.reply_text("Please use the bot in a private chat to get started.")
+        return ConversationHandler.END  # End the conversation if not in a private chat
+
+    # Your existing sir_command logic here
+    pass
+
+
+def check_row_number(update: Update, context: CallbackContext) -> int:
+    try:
+        row_number = int(update.message.text)
+        wb = openpyxl.load_workbook(EXCEL_FILE_PATH)
+        ws = wb.active
+        max_row = ws.max_row
+
+        if row_number <= max_row:
+            cell_value = ws.cell(row=row_number, column=1).value
+            if cell_value:
+                context.user_data['row_number'] = row_number
+                update.message.reply_text("Please enter the number of URLs (up to 8):") #"Row exists and is non-empty. Please enter the number of URLs (up to 3):"
+                return NUM_URLS_STATE
+            else:
+                update.message.reply_text("Please enter a valid row number.") #The specified row is empty. Please enter a valid row number.
+                return ROW_NUMBER_STATE
+        else:
+            update.message.reply_text("Please enter a valid row number.")  #The specified row number is out of range. Please enter a valid row number.
+            return ROW_NUMBER_STATE
+
+    except ValueError:
+        update.message.reply_text("Please enter a valid row number.")
+        return ROW_NUMBER_STATE
+
+def num_urls_received(update: Update, context: CallbackContext) -> int:
+    try:
+        num_urls = int(update.message.text)
+
+        if num_urls > 0 and num_urls <= 8:
+            context.user_data['num_urls'] = num_urls
+            context.user_data['urls'] = []
+            context.user_data['num_urls_received'] = True  # Add this line to mark that the number of URLs is received
+            update.message.reply_text("Please start providing the URLs.")
+            return URLS_STATE
+        else:
+            update.message.reply_text("Please enter number of url you wanna provide (between 1 and 8)")
+            return NUM_URLS_STATE
+
+    except ValueError:
+        update.message.reply_text("Please enter a valid number(between 1 and 8)")
+        return NUM_URLS_STATE
+
+def handle_urls_input(update: Update, context: CallbackContext) -> int:
+    # Log the user who triggered the function
+    user_id = update.effective_user.id
+    logger.info(f"Handling URL input for user ID: {user_id}")
+
+    # Add other logging statements as needed
+
+    # Ensure 'urls' key exists in user_data
+    if 'urls' not in context.user_data:
+        context.user_data['urls'] = []
+
+    # Handle URL input
+    url_to_check = update.message.text
+    result = extract_text_from_screenshot(update, context, url_to_check,roi_coordinates_click, roi_coordinates_no_scroll, roi_coordinates_scroll, scroll_down=False, scroll_amount=200)
+
+    cleaned_text_no_scroll = result[0] if isinstance(result, tuple) else result
+    estimated_date_scroll = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+
+    # Continue handling URL input and other logic...
+    row_number = context.user_data.get('row_number')
+    urls = context.user_data.get('urls', [])
+
+    try:
+        workbook = openpyxl.load_workbook(EXCEL_FILE_PATH)
+        sheet = workbook.active
+        page_name = sheet.cell(row=row_number, column=1).value
+    except Exception as e:
+        update.message.reply_text(f"Error occurred while loading the Excel sheet: {e}")
+        return ConversationHandler.END
+
+    if cleaned_text_no_scroll.lower() == page_name.strip().lower():
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        if estimated_date_scroll == current_date:
+            urls.append(url_to_check)
+            context.user_data['urls'] = urls
+
+            if len(urls) == context.user_data['num_urls']:
+                update.message.reply_text("All URLs received. Proceeding to process.")
+                preview_text = generate_preview_text(update, context, urls)
+                update.message.reply_text(preview_text)
+
+                num_urls = len(urls)
+                sheet.cell(row=row_number, column=4, value=num_urls)
+                save_success = save_urls_to_excel(row_number, urls, num_urls)
+
+                if save_success:
+                    update.message.reply_text("Information saved successfully.")
+                else:
+                    update.message.reply_text("Error occurred while saving information.")
+                return ConversationHandler.END
+            else:
+                update.message.reply_text(f"URL {len(urls)+1}/{context.user_data['num_urls']} received. Please provide the next URL.")
+
+            return URLS_STATE
+        else:
+            update.message.reply_text("Error 2024. Please provide the URL again.") #"The estimated date is not the current date. Please provide the URL again."
+            return URLS_STATE
+    else:
+        update.message.reply_text("Error 47. Please provide the URL again.")#"The extracted text does not match the page name. Please provide the URL again."
+        return URLS_STATE
+
+
+
+
+
+
+
+
+
+
+
+
+def generate_preview_text(update, context, urls):
+    preview_text = "Information saved in sheet:\n"
+
+    for idx, url in enumerate(urls):
+        preview_text += f"URL {idx + 1}: {url}\n"
+
+        # Get page name from Excel based on row number
+        row_number = context.user_data.get('row_number')
+        if not row_number:
+            preview_text += ".\n\n"#Error: Row number is not provided
+            continue
+
+        try:
+            workbook = openpyxl.load_workbook(EXCEL_FILE_PATH)
+            sheet = workbook.active
+            page_name = sheet.cell(row=row_number, column=1).value
+        except Exception as e:
+            preview_text += f" {e}\n\n" #Error loading Excel sheet:
+            continue
+
+        # Add page name and current date to the preview text
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        preview_text += f"Page Name: {page_name}\n"
+        preview_text += f"Date: {current_date}\n\n"
+
+    return preview_text
+
+
+
+
+
+
+
+
+
+
+
+
+def save_urls_to_excel(row_number, urls, num_urls):
+    try:
+        # Load the workbook or create a new one if it doesn't exist
+        try:
+            wb = openpyxl.load_workbook(EXCEL_FILE_PATH)
+        except FileNotFoundError:
+            print(f"File not found: {EXCEL_FILE_PATH}")
+            wb = openpyxl.Workbook()
+
+        # Select the active worksheet (create a new one if it doesn't exist)
+        ws = wb.active
+
+        # Update the specified columns (5, 7, and 9) of the given row with the URLs
+        ws.cell(row=row_number, column=5, value=urls[0] if len(urls) > 0 else None)
+        ws.cell(row=row_number, column=7, value=urls[1] if len(urls) > 1 else None)
+        ws.cell(row=row_number, column=9, value=urls[2] if len(urls) > 2 else None)
+        ws.cell(row=row_number, column=11, value=urls[3] if len(urls) > 3 else None)
+        ws.cell(row=row_number, column=13, value=urls[4] if len(urls) > 4 else None)
+        ws.cell(row=row_number, column=15, value=urls[5] if len(urls) > 5 else None)
+        ws.cell(row=row_number, column=17, value=urls[6] if len(urls) > 6 else None)
+        ws.cell(row=row_number, column=19, value=urls[7] if len(urls) > 7 else None)
+
+
+        # Save the number of URLs in column 4
+        ws.cell(row=row_number, column=4, value=num_urls)
+
+        # Save the workbook
+        wb.save(EXCEL_FILE_PATH)
+        wb.close()
+
+        print("Information saved successfully.")
+
+        return True  # Return True if saving is successful
+
+    except Exception as e:
+        print(f"Error occurred while saving to Excel: {e}")
+        return False  # Return False if saving encounters an error
+
+
+
+
+def extract_text_from_screenshot(update: Update, context: CallbackContext, url: str, roi_coordinates_click, roi_coordinates_no_scroll: tuple, roi_coordinates_scroll: tuple, scroll_down: bool = True, scroll_amount=200) -> None:
+
+    try:
+
+        update.message.reply_text("Please wait...")
+        # Set up the Chrome driver
+        chrome_options = webdriver.ChromeOptions()
+        chrome_options.add_argument('--headless')  # Run Chrome in headless mode (no GUI)
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+
+        driver = webdriver.Chrome(options=chrome_options)
+
+        # Open the URL
+        driver.get(url)
+
+        # Wait for the page to load completely (add a 5-second delay)
+        time.sleep(5)
+        driver.set_window_size(900, 800)
+
+        # Perform the click action at the specified coordinates
+        driver.execute_script(f"document.elementFromPoint({roi_coordinates_click[0]}, {roi_coordinates_click[1]}).click();")
+        #print("Clicked successfully within ROI")
+
+        # Wait for the click action to take effect
+        time.sleep(2)  # Adjust the waiting time as needed
+
+        # Capture screenshot
+        screenshot_path = f"screenshot_{uuid.uuid4().hex}.png"
+        driver.save_screenshot(screenshot_path)
+
+        # Open the screenshot image
+        img = Image.open(screenshot_path)
+
+        # Extract text from the specified regions in the screenshot
+        roi_image_no_scroll = img.crop(roi_coordinates_no_scroll)
+        roi_image_scroll = img.crop(roi_coordinates_scroll)
+
+        # Configure Tesseract OCR with special character handling
+        custom_config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSUVWXYZabcdefghijklmnopqrstuvwxyz_-. '
+
+        text_no_scroll = pytesseract.image_to_string(roi_image_no_scroll, config=custom_config)
+        text_scroll = pytesseract.image_to_string(roi_image_scroll, config=custom_config)
+
+        #print(text_no_scroll)
+        #print(text_scroll)
+
+        estimated_date = estimate_date_from_text(text_scroll)
+        cleaned_text = text_no_scroll.strip().rstrip('Follow_.')
+
+        # Reply to the user with the extracted information
+        if cleaned_text:
+            update.message.reply_text(f"{url} URL belongs to :\n{cleaned_text}")#Extracted text from {url} without scroll:\n{cleaned_text}
+        else:
+            update.message.reply_text(f"error 48 please wait ")#Failed to extract text from {url} without scroll.
+
+        if estimated_date:
+            reply_message = f"{url} uploded on : {estimated_date}" #Extracted text from {url} with scroll:\n\nEstimated date: {estimated_date}
+        else:
+            reply_message = f"Error 2024.2"#Extracted text from {url} with scroll:\n\nFailed to estimate the date.
+
+        update.message.reply_text(reply_message)
+        return cleaned_text, estimated_date
+
+    except Exception as e:
+        update.message.reply_text(f"Error: {e}")
+
+    finally:
+        try:
+            # Close the browser
+            driver.quit()
+        except UnboundLocalError:
+            pass  # Handle the case when the 'driver' variable is not defined
+
+
+
+
+
+def estimate_date_from_text(text: str) -> str:
+    try:
+        # Check if 'ago' is present in the text
+        if 'ago' in text:
+            # Remove 'ago' from the text
+            text = text.replace('ago', '')
+
+            # Handle specific exception formats
+            if text.strip() == 'Aday':
+                past_time = timedelta(days=1)
+            elif text.strip() == 'Aminute':
+                past_time = timedelta(minutes=1)
+            elif text.strip() == 'Ahour':
+                past_time = timedelta(hours=1)
+            else:
+                # Extract the numeric value and unit (hours, minutes, or days)
+                match = re.search(r'(\d+)\s*(day|hour|minute)s?', text)
+                if match:
+                    value = int(match.group(1))
+                    unit = match.group(2)
+
+                    # Calculate the past time delta based on the unit
+                    if unit == 'hour':
+                        past_time = timedelta(hours=value)
+                    elif unit == 'minute':
+                        past_time = timedelta(minutes=value)
+                    elif unit == 'day':
+                        past_time = timedelta(days=value)
+                    else:
+                        raise ValueError("Error 2024U")#Invalid time unit. Please provide time in 'hours', 'minutes', or 'days' format.
+
+                else:
+                    raise ValueError("Error 2024A") #Invalid time format. Please provide time in 'X hours', 'X minutes', '1day', '1minute', or '1hour' format.
+
+            # Get the current datetime
+            current_time = datetime.now()
+
+            # Calculate the past datetime
+            past_datetime = current_time - past_time
+
+            # Return the estimated date of the past datetime
+            estimated_date = past_datetime.strftime('%Y-%m-%d')
+            return estimated_date
+
+        else:
+            # Check if the input contains a perfect date (e.g., 'November 30, 2023' or 'March3.2023')
+            match_comma = re.match(r'([A-Za-z]+)(\d{1,2})[,.]?(\d{4})?', text)
+            if match_comma:
+                month = match_comma.group(1)
+                day = int(match_comma.group(2))
+                year = int(match_comma.group(3)) if match_comma.group(3) else datetime.now().year
+
+                # Construct the datetime object for the provided date
+                past_datetime = datetime(year, datetime.strptime(month, '%B').month, day)
+
+                # Return the formatted date string
+                estimated_date = past_datetime.strftime('%Y-%m-%d')
+                return estimated_date
+            else:
+                raise ValueError("Error 2024F")#Invalid date format. Please provide a date in 'MonthDay', 'MonthDay,Year', or 'MonthDay.Year' format.
+
+    except Exception as e:
+        return f"Error: {e}"
+
+def cancel(update: Update, context: CallbackContext) -> int:
+    update.message.reply_text("Conversation canceled.")
+    return ConversationHandler.END
+
+
+
+def clear_other_posts(sheet, row_num, max_urls):
+    # Define URL columns
+    url_columns = [5, 7, 9]  # E, G, and I columns
+
+    # Find the last URL column
+    last_url_column = max(url_columns)
+
+    # Determine the number of URLs currently in the row
+    num_urls = 0
+    for col in url_columns:
+        if sheet.cell(row=row_num, column=col).value:
+            num_urls += 1
+
+    # Check if the maximum number of URLs is exceeded
+    if num_urls > max_urls:
+        # Clear the last URL and its corresponding metadata
+        for col in url_columns:
+            if sheet.cell(row=row_num, column=col).value:
+                sheet.cell(row=row_num, column=col, value=None)
+                sheet.cell(row=row_num, column=col + 1, value=None)  # Clear metadata column as well
+
+
+
+
+
+
+
+
+def give_sheet(update: Update, context: CallbackContext) -> None:
+    user_id = update.effective_user.id  # Get the ID of the user who sent the command
+    try:
+        # Send the updated Excel sheet to the user
+        with open(EXCEL_FILE_PATH, 'rb') as file:
+            update.message.reply_document(document=file, caption='Updated Excel Sheet')
+    except Exception as e:
+        update.message.reply_text(f'Error occurred while sending the Excel sheet: {e}')
+
+def main():
+    # Initialize the updater and dispatcher
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    # Define conversation handler
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("sir", sir_command)],
+        states={
+            ROW_NUMBER_STATE: [MessageHandler(Filters.regex(r'^\d+$'), check_row_number)],
+            NUM_URLS_STATE: [MessageHandler(Filters.regex(r'^[1-8]$'), num_urls_received)],
+            URLS_STATE: [MessageHandler(Filters.text & ~Filters.command, handle_urls_input)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    # Add handlers to the dispatcher
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(conv_handler)
+    dp.add_handler(CommandHandler("givesheet", give_sheet))
+
+    # Start the bot
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
